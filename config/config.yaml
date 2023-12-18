@@ -1,0 +1,17 @@
+# Azure OpenAI接口配置
+AZURE_OPENAI:
+  api_type: "azure"
+  api_version: "2023-12-01-preview"
+  regions:
+    East_US2:
+      api_key: "XXXXX"
+      api_base: "https://XXXXX.openai.azure.com/"
+      available_models: [
+        "gpt-4", "gpt-4-1106-preview", "gpt-35-turbo", "gpt-35-turbo-16k"
+      ]
+    Japan:
+      api_key: "XXXXX"
+      api_base: "https://XXXXX.openai.azure.com/"
+      available_models: [
+        "gpt-4", "gpt-4-1106-preview", "gpt-35-turbo", "gpt-35-turbo-16k"
+      ]
