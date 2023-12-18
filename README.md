@@ -9,7 +9,7 @@ config/config.yaml
 格式：
 
 ```
-RE_OPENAI:	# 固定名称
+AZURE_OPENAI:	# 固定名称
   api_type: "azure"	# 固定名称
   api_version: "2023-12-01-preview"	# 你的api版本
   regions:	# 你的不同区域的配置信息

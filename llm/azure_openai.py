@@ -117,7 +117,7 @@ class OpenAIService:
         Args:
             messages (List[str]): 聊天消息列表。
             model (str, optional): 模型名称。默认为"gpt-35-turbo"。
-            timeout (float, optional): 超时时间（秒）。默认为15秒。
+            timeout (float, optional): 超时时间（秒）。
             stream (bool, optional): 是否使用流式处理。默认为True。
             **kwargs: 其他可选参数。
 
