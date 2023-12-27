@@ -1,16 +1,33 @@
 import asyncio
 import logging
+import os
 import random
+import sys
 from typing import List, Tuple
 
 import httpx
 import yaml
 
-from func_timeout import func_timeout, FunctionTimedOut
-from openai import AzureOpenAI
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+from func_timeout import FunctionTimedOut, func_timeout
+from openai import AsyncAzureOpenAI, AzureOpenAI
+
 from utils.token_calculator import num_tokens_from_messages
 
 CONFIG = yaml.safe_load(open("config/config.yaml", "r"))
+
+# httpx timeout settings
+CONNECTION_TIMEOUT = 2.0
+READ_TIMEOUT = 5.0
+WRITE_TIMEOUT = 20.0
+POOL_TIMEOUT = 10.0
+HTTP_TIMEOUT = httpx.Timeout(
+    connect=CONNECTION_TIMEOUT,
+    read=READ_TIMEOUT,
+    write=WRITE_TIMEOUT,
+    pool=POOL_TIMEOUT,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -26,10 +43,12 @@ class OpenAIService:
 
     Methods:
         __init__(self, config=CONFIG["AZURE_OPENAI"]): Initializes the OpenAIService object.
-        __test_regions_endpoints(self, available_regions): Tests the endpoints of the available regions asynchronously.
-        __test_endpoint(self, region, api_base): Tests a specific endpoint.
+        __test_regions_endpoints(self, available_regions): Asynchronously tests the endpoints of the available regions.
+        __test_endpoint(self, region, api_base): Asynchronously tests a specific endpoint.
         __get_regions_for_model(self, model): Returns the regions where a specific model is available.
-        get_chat_completion(self, messages, model, timeout, stream, **kwargs): Retrieves chat completions from the OpenAI service.
+        __get_chat_completion(self, is_async, messages, model, timeout, stream, **kwargs): Asynchronously retrieves chat completions from the OpenAI service.
+        aget_chat_completion(self, messages, model, timeout, stream, **kwargs): Asynchronously retrieves chat completions from the OpenAI service.
+        get_chat_completion(self, messages, model, timeout, stream, **kwargs): Synchronously retrieves chat completions from the OpenAI service.
     """
 
     def __init__(self, config=CONFIG["AZURE_OPENAI"]):
@@ -45,7 +64,7 @@ class OpenAIService:
             "presence_penalty": 0,
         }
 
-    async def __test_regions_endpoints(self, available_regions):
+    async def __test_regions_endpoints(self, available_regions: List[str]):
         tasks = [
             self.__test_endpoint(region, self.regions[region]["api_base"])
             for region in available_regions
@@ -53,7 +72,7 @@ class OpenAIService:
         results = await asyncio.gather(*tasks)
         return [region for region, result in zip(available_regions, results) if result]
 
-    async def __test_endpoint(self, region, api_base):
+    async def __test_endpoint(self, region: str, api_base: str):
         """
         Test the endpoint for a specific region and API base by pre-ping.
 
@@ -96,12 +115,97 @@ class OpenAIService:
             )
             return False
 
-    def __get_regions_for_model(self, model):
+    def __get_regions_for_model(self, model: str):
         return [
             region
             for region, details in self.regions.items()
             if model in details["available_models"]
         ]
+
+    async def aget_chat_completion(
+        self,
+        messages: List[str],
+        model: str = "gpt-35-turbo",
+        timeout: float = 30.0,
+        stream: bool = True,
+        **kwargs,
+    ) -> Tuple[str, int]:
+        """
+        Asynchronously retrieves chat completions from the AsyncAzureOpenAI service.
+
+        Args:
+            messages (List[str]): The list of messages to be completed.
+            model (str, optional): The model to be used for the completion. Defaults to "gpt-35-turbo".
+            timeout (float, optional): The timeout for the request. Defaults to 30.0.
+            stream (bool, optional): Whether the response should be streamed. Defaults to True.
+            **kwargs: Additional parameters for the chat completion.
+
+        Returns:
+            Tuple[str, int]: The completed chat and the number of tokens used.
+        """
+        parameters = self.parameters.copy()
+        parameters.update(kwargs)
+
+        # get available regions for the model
+        available_regions = self.__get_regions_for_model(model)
+        # use random order to reduce the chance of hitting the same region
+        random.shuffle(available_regions)
+
+        # test the endpoints of the available regions
+        success_regions = await self.__test_regions_endpoints(available_regions)
+        # times 3 to retry the failed regions
+        success_regions = success_regions * 3
+
+        for region in success_regions:
+            api_base = self.regions[region]["api_base"]
+
+            client = AsyncAzureOpenAI(
+                azure_endpoint=api_base,
+                api_key=self.regions[region]["api_key"],
+                api_version=self.api_version,
+            )
+
+            logger.debug(f"Start using endpoint {api_base} | {model}")
+            try:
+                try:
+                    response = await asyncio.wait_for(
+                        client.with_options(
+                            max_retries=1,
+                            timeout=HTTP_TIMEOUT,
+                        ).chat.completions.create(
+                            model=model,
+                            messages=messages,
+                            stream=stream,
+                            **parameters,
+                        ),
+                        timeout,
+                    )
+                except asyncio.TimeoutError as e:
+                    logger.error(
+                        f"Timeout error using endpoint {api_base} | {model}: {e}"
+                    )
+                    continue
+
+                if not stream:
+                    content = response.choices[0].message.content
+                    tokens = response.usage.total_tokens
+                    yield content, tokens
+                    return
+
+                tokens = num_tokens_from_messages(messages, model=model)
+                async for chunk in response:
+                    try:
+                        chunk_message = chunk.choices[0].delta.content
+                        if chunk_message is not None:
+                            tokens += 1
+                            yield chunk_message, tokens
+                    except:
+                        pass
+                return
+            except Exception as e:
+                logger.error(f"Error using endpoint {api_base} | {model}: {e}")
+
+        raise RuntimeError("All endpoints failed")
 
     def get_chat_completion(
         self,
@@ -112,33 +216,29 @@ class OpenAIService:
         **kwargs,
     ) -> Tuple[str, int]:
         """
-        获取聊天完成结果。
+        Synchronously retrieves chat completions from the AzureOpenAI service.
 
         Args:
-            messages (List[str]): 聊天消息列表。
-            model (str, optional): 模型名称。默认为"gpt-35-turbo"。
-            timeout (float, optional): 超时时间（秒）。
-            stream (bool, optional): 是否使用流式处理。默认为True。
-            **kwargs: 其他可选参数。
+            messages (List[str]): The list of messages to be completed.
+            model (str, optional): The model to be used for the completion. Defaults to "gpt-35-turbo".
+            timeout (float, optional): The timeout for the request. Defaults to 30.0.
+            stream (bool, optional): Whether the response should be streamed. Defaults to True.
+            **kwargs: Additional parameters for the chat completion.
 
         Returns:
-            Tuple[str, int]: 聊天完成的内容和使用的token数。
-
-        Raises:
-            Exception: 所有的节点都失败。
+            Tuple[str, int]: The completed chat and the number of tokens used.
         """
-        http_timeout = httpx.Timeout(timeout)
-        parameters = self.parameters
+        parameters = self.parameters.copy()
         parameters.update(kwargs)
 
-        # 获取当前模型的可用地区，并打乱顺序(随机节点顺序，实现最简单的负载均衡策略)
+        # get available regions for the model
         available_regions = self.__get_regions_for_model(model)
+        # use random order to reduce the chance of hitting the same region
         random.shuffle(available_regions)
 
-        # 测试各个地区的endpoint是否可用
+        # test the endpoints of the available regions
         success_regions = asyncio.run(self.__test_regions_endpoints(available_regions))
-
-        # 扩充列表三倍，达到重试三次的效果
+        # times 3 to retry the failed regions
         success_regions = success_regions * 3
 
         for region in success_regions:
@@ -156,7 +256,7 @@ class OpenAIService:
                     response = func_timeout(
                         timeout,
                         client.with_options(
-                            max_retries=1, timeout=http_timeout
+                            max_retries=1, timeout=HTTP_TIMEOUT
                         ).chat.completions.create,
                         kwargs={
                             "model": model,
@@ -166,28 +266,28 @@ class OpenAIService:
                         },
                     )
                 except FunctionTimedOut as e:
-                    raise Exception("Function timed out") from e
+                    logger.error(
+                        f"Timeout error using endpoint {api_base} | {model}: {e}"
+                    )
+                    continue
 
                 if not stream:
                     content = response.choices[0].message.content
                     tokens = response.usage.total_tokens
-                    return content, tokens
+                    yield content, tokens
+                    return
 
-                collected_messages = []
                 tokens = num_tokens_from_messages(messages, model=model)
                 for chunk in response:
                     try:
                         chunk_message = chunk.choices[0].delta.content
                         if chunk_message is not None:
-                            collected_messages.append(chunk_message)
                             tokens += 1
+                            yield chunk_message, tokens
                     except:
                         pass
-
-                content = "".join(collected_messages)
-                return content, tokens
-
+                return
             except Exception as e:
                 logger.error(f"Error using endpoint {api_base} | {model}: {e}")
 
-        raise Exception("All endpoints failed")
+        raise RuntimeError("All endpoints failed")
